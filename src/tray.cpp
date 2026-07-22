@@ -35,12 +35,12 @@ HWND TrayCreate(HINSTANCE hInstance, Config& config) {
 
     if (!hwnd) return nullptr;
 
-    // Load icon at tray size (16×16). LoadImageW respects the icon's
-    // embedded sizes and picks the closest match; LoadIconW caches at
-    // system size and can serve a stale or wrong icon.
-    int iconSize = GetSystemMetrics(SM_CXSMICON);
+    // Load icon at 32×32 — the 16×16 entry in some ICO files has
+    // palette/format issues that render as solid orange in the small
+    // tray view. Loading 32×32 and letting Windows scale down looks
+    // correct in both small and large notification area views.
     HICON hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON),
-        IMAGE_ICON, iconSize, iconSize, LR_DEFAULTCOLOR);
+        IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
     if (!hIcon) {
         hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_APPLICATION));
     }
