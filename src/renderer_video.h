@@ -2,8 +2,6 @@
 #include <windows.h>
 #include <mfapi.h>
 #include <mfmediaengine.h>
-#include <d3d11.h>
-#include <dxgi1_2.h>
 #include <string>
 
 class VideoRenderer : public IMFMediaEngineNotify {
@@ -16,7 +14,7 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override;
     ULONG STDMETHODCALLTYPE Release() override;
 
-    // IMFMediaEngineNotify — single method
+    // IMFMediaEngineNotify
     HRESULT STDMETHODCALLTYPE EventNotify(DWORD event, DWORD_PTR param1, DWORD param2) override;
 
     bool Initialize(HWND hwnd);
@@ -46,15 +44,5 @@ private:
     bool m_paused = false;
     bool m_mediaEngineReady = false;
 
-    // D3D11 for Media Foundation rendering
-    ID3D11Device* m_d3dDevice = nullptr;
-    ID3D11DeviceContext* m_d3dContext = nullptr;
-    IDXGISwapChain1* m_swapChain = nullptr;
-    ID3D11RenderTargetView* m_rtv = nullptr;
-
-    // Media Foundation
     IMFMediaEngine* m_mediaEngine = nullptr;
-
-    bool CreateSwapChain();
-    void UpdateRenderTargetView();
 };

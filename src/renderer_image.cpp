@@ -1,11 +1,11 @@
 #include "renderer_image.h"
 #include "config.h"
+#include "workerw.h"
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "windowscodecs.lib")
 
 ImageRenderer::ImageRenderer() {}
-
 ImageRenderer::~ImageRenderer() { Shutdown(); }
 
 bool ImageRenderer::Initialize(HWND hwnd) {
@@ -24,6 +24,22 @@ bool ImageRenderer::Initialize(HWND hwnd) {
         return false;
     }
 
+    // Create render target with virtual screen size (not GetClientRect,
+    // which returns 0×0 before the window is shown/parented).
+    RECT vr = GetVirtualScreenRect();
+    UINT w = vr.right - vr.left;
+    UINT h = vr.bottom - vr.top;
+
+    D2D1_SIZE_U size = D2D1::SizeU(w, h);
+    hr = m_factory->CreateHwndRenderTarget(
+        D2D1::RenderTargetProperties(),
+        D2D1::HwndRenderTargetProperties(m_hwnd, size, D2D1_PRESENT_OPTIONS_NONE),
+        &m_renderTarget);
+    if (FAILED(hr)) {
+        LogMessage(L"ImageRenderer: CreateHwndRenderTarget failed");
+        return false;
+    }
+
     return true;
 }
 
@@ -34,60 +50,10 @@ void ImageRenderer::Shutdown() {
     if (m_factory) { m_factory->Release(); m_factory = nullptr; }
 }
 
-bool ImageRenderer::CreateRenderTarget(UINT width, UINT height) {
-    if (m_renderTarget) {
-        m_renderTarget->Release();
-        m_renderTarget = nullptr;
-    }
-
-    // Use explicit size — GetClientRect can return 0x0 before the parent
-    // lays out the child window.
-    if (width == 0 || height == 0) {
-        RECT rc;
-        GetClientRect(m_hwnd, &rc);
-        width = rc.right - rc.left;
-        height = rc.bottom - rc.top;
-    }
-
-    if (width == 0 || height == 0) {
-        LogMessage(L"ImageRenderer: Render target size is 0x0");
-        return false;
-    }
-
-    D2D1_SIZE_U size = D2D1::SizeU(width, height);
-
-    HRESULT hr = m_factory->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
-        D2D1::HwndRenderTargetProperties(m_hwnd, size,
-            D2D1_PRESENT_OPTIONS_NONE),
-        &m_renderTarget);
-
-    if (FAILED(hr)) {
-        LogMessage(L"ImageRenderer: CreateHwndRenderTarget failed");
-        return false;
-    }
-    return true;
-}
-
 bool ImageRenderer::LoadImageFile(const std::wstring& path) {
-    if (!m_wicFactory) return false;
+    if (!m_wicFactory || !m_renderTarget) return false;
 
-    // Release old bitmap
-    if (m_bitmap) {
-        m_bitmap->Release();
-        m_bitmap = nullptr;
-    }
-
-    // Get window size for render target
-    RECT rc;
-    GetClientRect(m_hwnd, &rc);
-    UINT rtWidth = rc.right - rc.left;
-    UINT rtHeight = rc.bottom - rc.top;
-
-    // Create render target if needed
-    if (!m_renderTarget) {
-        if (!CreateRenderTarget(rtWidth, rtHeight)) return false;
-    }
+    if (m_bitmap) { m_bitmap->Release(); m_bitmap = nullptr; }
 
     IWICBitmapDecoder* decoder = nullptr;
     HRESULT hr = m_wicFactory->CreateDecoderFromFilename(
@@ -100,11 +66,7 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
 
     IWICBitmapFrameDecode* frame = nullptr;
     hr = decoder->GetFrame(0, &frame);
-    if (FAILED(hr)) {
-        decoder->Release();
-        LogMessage(L"ImageRenderer: GetFrame failed");
-        return false;
-    }
+    if (FAILED(hr)) { decoder->Release(); LogMessage(L"ImageRenderer: GetFrame failed"); return false; }
 
     IWICFormatConverter* converter = nullptr;
     hr = m_wicFactory->CreateFormatConverter(&converter);
@@ -113,18 +75,20 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
             WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeMedianCut);
     }
 
-    // Scale to window size to save memory (like Rust version)
+    // Scale to render target size to save memory
     IWICBitmapScaler* scaler = nullptr;
-    if (SUCCEEDED(hr) && rtWidth > 0 && rtHeight > 0) {
-        hr = m_wicFactory->CreateBitmapScaler(&scaler);
-        if (SUCCEEDED(hr)) {
-            hr = scaler->Initialize(converter, rtWidth, rtHeight,
-                WICBitmapInterpolationModeFant);
+    if (SUCCEEDED(hr)) {
+        D2D1_SIZE_U rtSize = m_renderTarget->GetPixelSize();
+        if (rtSize.width > 0 && rtSize.height > 0) {
+            hr = m_wicFactory->CreateBitmapScaler(&scaler);
+            if (SUCCEEDED(hr)) {
+                hr = scaler->Initialize(converter, rtSize.width, rtSize.height,
+                    WICBitmapInterpolationModeFant);
+            }
         }
     }
 
     if (SUCCEEDED(hr)) {
-        // Use scaler if available, otherwise converter
         IWICBitmapSource* source = scaler ? (IWICBitmapSource*)scaler : (IWICBitmapSource*)converter;
         hr = m_renderTarget->CreateBitmapFromWicBitmap(source, nullptr, &m_bitmap);
     }
@@ -150,7 +114,6 @@ void ImageRenderer::Render() {
 
     D2D1_SIZE_F rtSize = m_renderTarget->GetSize();
     D2D1_RECT_F destRect = D2D1::RectF(0, 0, rtSize.width, rtSize.height);
-
     m_renderTarget->DrawBitmap(m_bitmap, destRect, 1.0f,
         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 

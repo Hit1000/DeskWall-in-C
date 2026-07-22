@@ -1,15 +1,12 @@
 #include "renderer_video.h"
 #include "config.h"
+#include <shlwapi.h>
 
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfplat.lib")
-#pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
 
 VideoRenderer::VideoRenderer() {}
-
 VideoRenderer::~VideoRenderer() { Shutdown(); }
 
 // IUnknown
@@ -25,7 +22,6 @@ HRESULT STDMETHODCALLTYPE VideoRenderer::QueryInterface(REFIID riid, void** ppvO
 }
 
 ULONG STDMETHODCALLTYPE VideoRenderer::AddRef() { return InterlockedIncrement(&m_refCount); }
-
 ULONG STDMETHODCALLTYPE VideoRenderer::Release() {
     ULONG ref = InterlockedDecrement(&m_refCount);
     if (ref == 0) delete this;
@@ -43,50 +39,38 @@ HRESULT STDMETHODCALLTYPE VideoRenderer::EventNotify(DWORD event, DWORD_PTR, DWO
             m_mediaEngine->Play();
         }
     }
+    if (event == MF_MEDIA_ENGINE_EVENT_ERROR) {
+        LogMessage(L"VideoRenderer: Media Engine error");
+    }
     return S_OK;
 }
 
 bool VideoRenderer::Initialize(HWND hwnd) {
     m_hwnd = hwnd;
 
-    // Create D3D11 device
-    D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
-    D3D_FEATURE_LEVEL featureLevel;
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-#ifdef _DEBUG
-    flags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        flags, featureLevels, 1, D3D11_SDK_VERSION,
-        &m_d3dDevice, &featureLevel, &m_d3dContext);
-    if (FAILED(hr)) {
-        LogMessage(L"VideoRenderer: D3D11 device creation failed");
-        return false;
-    }
-
-    if (!CreateSwapChain()) return false;
-
-    // Initialize Media Foundation
     MFStartup(MF_VERSION);
 
-    // Create Media Engine
     IMFMediaEngineClassFactory* factory = nullptr;
-    hr = CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_ALL,
-                          IID_PPV_ARGS(&factory));
+    HRESULT hr = CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_ALL,
+                                  IID_PPV_ARGS(&factory));
     if (FAILED(hr)) {
         LogMessage(L"VideoRenderer: MediaEngine factory creation failed");
         return false;
     }
 
     IMFAttributes* attrs = nullptr;
-    MFCreateAttributes(&attrs, 4);
-    attrs->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, this);
-    attrs->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
+    MFCreateAttributes(&attrs, 2);
 
-    // MF_MEDIA_ENGINE_REAL_TIME_MODE is a creation flag (0x2), not an attribute
-    DWORD createFlags = MF_MEDIA_ENGINE_REAL_TIME_MODE;
-    hr = factory->CreateInstance(createFlags, attrs, &m_mediaEngine);
+    // Callback for lifecycle events
+    attrs->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, this);
+
+    // HWND playback mode: Media Foundation presents frames directly to this window.
+    // This is the key attribute — without it, MF has nowhere to render.
+    attrs->SetUINT64(MF_MEDIA_ENGINE_PLAYBACK_HWND, (UINT64)(ULONG_PTR)m_hwnd);
+
+    // MF_MEDIA_ENGINE_REAL_TIME_MODE is a creation flag (0x2)
+    hr = factory->CreateInstance(MF_MEDIA_ENGINE_REAL_TIME_MODE, attrs, &m_mediaEngine);
+
     if (attrs) attrs->Release();
     if (factory) factory->Release();
 
@@ -98,63 +82,21 @@ bool VideoRenderer::Initialize(HWND hwnd) {
     return true;
 }
 
-bool VideoRenderer::CreateSwapChain() {
-    IDXGIDevice* dxgiDevice = nullptr;
-    HRESULT hr = m_d3dDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
-    if (FAILED(hr)) return false;
+bool VideoRenderer::LoadVideo(const std::wstring& path) {
+    if (!m_mediaEngine) return false;
+    m_mediaEngineReady = false;
 
-    IDXGIAdapter* adapter = nullptr;
-    hr = dxgiDevice->GetAdapter(&adapter);
-    dxgiDevice->Release();
-    if (FAILED(hr)) return false;
-
-    IDXGIFactory2* factory = nullptr;
-    hr = adapter->GetParent(IID_PPV_ARGS(&factory));
-    adapter->Release();
-    if (FAILED(hr)) return false;
-
-    RECT rc;
-    GetClientRect(m_hwnd, &rc);
-
-    DXGI_SWAP_CHAIN_DESC1 desc = {};
-    desc.Width = rc.right - rc.left;
-    desc.Height = rc.bottom - rc.top;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount = 2;
-    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    desc.Flags = DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
-
-    hr = factory->CreateSwapChainForHwnd(m_d3dDevice, m_hwnd, &desc, nullptr, nullptr, &m_swapChain);
-    factory->Release();
-
+    // Convert filesystem path to file:// URL — MFMediaEngine::SetSource requires a URL
+    wchar_t url[2084]; // INTERNET_MAX_URL_LENGTH
+    DWORD urlLen = 2084;
+    HRESULT hr = UrlCreateFromPathW(path.c_str(), url, &urlLen, 0);
     if (FAILED(hr)) {
-        LogMessage(L"VideoRenderer: Swap chain creation failed");
+        LogMessage(L"VideoRenderer: UrlCreateFromPathW failed for: " + path);
         return false;
     }
 
-    UpdateRenderTargetView();
-    return true;
-}
-
-void VideoRenderer::UpdateRenderTargetView() {
-    if (m_rtv) { m_rtv->Release(); m_rtv = nullptr; }
-
-    ID3D11Texture2D* backBuffer = nullptr;
-    if (m_swapChain && SUCCEEDED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
-        m_d3dDevice->CreateRenderTargetView(backBuffer, nullptr, &m_rtv);
-        backBuffer->Release();
-    }
-}
-
-bool VideoRenderer::LoadVideo(const std::wstring& path) {
-    if (!m_mediaEngine) return false;
-
-    m_mediaEngineReady = false;
-
-    BSTR bstr = SysAllocString(path.c_str());
-    HRESULT hr = m_mediaEngine->SetSource(bstr);
+    BSTR bstr = SysAllocString(url);
+    hr = m_mediaEngine->SetSource(bstr);
     SysFreeString(bstr);
 
     if (FAILED(hr)) {
@@ -166,28 +108,8 @@ bool VideoRenderer::LoadVideo(const std::wstring& path) {
 }
 
 void VideoRenderer::Render() {
-    if (!m_mediaEngine || !m_mediaEngineReady || !m_swapChain) return;
-
-    // Transfer the media engine's frame to the swap chain back buffer
-    LONGLONG pts = 0;
-    if (m_mediaEngine->OnVideoStreamTick(&pts) == S_OK) {
-        ID3D11Texture2D* backBuffer = nullptr;
-        if (SUCCEEDED(m_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
-            // Transfer frame via MediaEngine's TransferVideoFrame
-            // Create a DXGI surface wrapper for the back buffer
-            IDXGISurface* surface = nullptr;
-            if (SUCCEEDED(backBuffer->QueryInterface(IID_PPV_ARGS(&surface)))) {
-                MFVideoNormalizedRect srcRect = { 0.0f, 0.0f, 1.0f, 1.0f };
-                RECT dstRect;
-                GetClientRect(m_hwnd, &dstRect);
-                m_mediaEngine->TransferVideoFrame(surface, &srcRect, &dstRect, nullptr);
-                surface->Release();
-            }
-            backBuffer->Release();
-        }
-    }
-
-    m_swapChain->Present(1, 0);
+    // In HWND playback mode, MF presents frames to the window itself.
+    // Nothing to draw here — the engine handles it.
 }
 
 void VideoRenderer::SetMuted(bool muted) {
@@ -210,12 +132,8 @@ void VideoRenderer::Resume() {
     if (m_mediaEngine) m_mediaEngine->Play();
 }
 
-void VideoRenderer::OnResize(UINT width, UINT height) {
-    if (m_swapChain && width > 0 && height > 0) {
-        if (m_rtv) { m_rtv->Release(); m_rtv = nullptr; }
-        m_swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
-        UpdateRenderTargetView();
-    }
+void VideoRenderer::OnResize(UINT, UINT) {
+    // HWND playback mode handles resize automatically
 }
 
 void VideoRenderer::Shutdown() {
@@ -224,9 +142,5 @@ void VideoRenderer::Shutdown() {
         m_mediaEngine->Release();
         m_mediaEngine = nullptr;
     }
-    if (m_rtv) { m_rtv->Release(); m_rtv = nullptr; }
-    if (m_swapChain) { m_swapChain->Release(); m_swapChain = nullptr; }
-    if (m_d3dContext) { m_d3dContext->Release(); m_d3dContext = nullptr; }
-    if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
     MFShutdown();
 }

@@ -12,15 +12,10 @@ public:
     bool Initialize(HWND hwnd);
     void Shutdown();
 
-    // Load an image file. Returns true on success.
     bool LoadImageFile(const std::wstring& path);
-
-    // Render the current image to fill the window.
     void Render();
 
-    // Resize render target when window size changes.
     void OnResize(UINT width, UINT height);
-
     bool HasImage() const { return m_bitmap != nullptr; }
 
 private:
@@ -29,7 +24,4 @@ private:
     ID2D1HwndRenderTarget* m_renderTarget = nullptr;
     ID2D1Bitmap* m_bitmap = nullptr;
     IWICImagingFactory* m_wicFactory = nullptr;
-
-    bool CreateRenderTarget(UINT width = 0, UINT height = 0);
-    void DrawImage();
 };
