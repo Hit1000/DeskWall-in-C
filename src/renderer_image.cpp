@@ -24,8 +24,7 @@ bool ImageRenderer::Initialize(HWND hwnd) {
         return false;
     }
 
-    // Create render target with virtual screen size (not GetClientRect,
-    // which returns 0×0 before the window is shown/parented).
+    // Create render target at virtual screen size
     RECT vr = GetVirtualScreenRect();
     UINT w = vr.right - vr.left;
     UINT h = vr.bottom - vr.top;
@@ -66,7 +65,7 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
 
     IWICBitmapFrameDecode* frame = nullptr;
     hr = decoder->GetFrame(0, &frame);
-    if (FAILED(hr)) { decoder->Release(); LogMessage(L"ImageRenderer: GetFrame failed"); return false; }
+    if (FAILED(hr)) { decoder->Release(); return false; }
 
     IWICFormatConverter* converter = nullptr;
     hr = m_wicFactory->CreateFormatConverter(&converter);
@@ -75,25 +74,12 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
             WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeMedianCut);
     }
 
-    // Scale to render target size to save memory
-    IWICBitmapScaler* scaler = nullptr;
+    // Create bitmap at original resolution — D2D's DrawBitmap handles
+    // scaling to render target size on the GPU, no CPU-side scaling needed.
     if (SUCCEEDED(hr)) {
-        D2D1_SIZE_U rtSize = m_renderTarget->GetPixelSize();
-        if (rtSize.width > 0 && rtSize.height > 0) {
-            hr = m_wicFactory->CreateBitmapScaler(&scaler);
-            if (SUCCEEDED(hr)) {
-                hr = scaler->Initialize(converter, rtSize.width, rtSize.height,
-                    WICBitmapInterpolationModeFant);
-            }
-        }
+        hr = m_renderTarget->CreateBitmapFromWicBitmap(converter, nullptr, &m_bitmap);
     }
 
-    if (SUCCEEDED(hr)) {
-        IWICBitmapSource* source = scaler ? (IWICBitmapSource*)scaler : (IWICBitmapSource*)converter;
-        hr = m_renderTarget->CreateBitmapFromWicBitmap(source, nullptr, &m_bitmap);
-    }
-
-    if (scaler) scaler->Release();
     if (converter) converter->Release();
     if (frame) frame->Release();
     if (decoder) decoder->Release();
@@ -102,7 +88,6 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
         LogMessage(L"ImageRenderer: Failed to create D2D bitmap");
         return false;
     }
-
     return true;
 }
 
@@ -118,13 +103,10 @@ void ImageRenderer::Render() {
         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 
     HRESULT hr = m_renderTarget->EndDraw();
-    if (FAILED(hr)) {
-        LogMessage(L"ImageRenderer: EndDraw failed");
-    }
+    if (FAILED(hr)) LogMessage(L"ImageRenderer: EndDraw failed");
 }
 
 void ImageRenderer::OnResize(UINT width, UINT height) {
-    if (m_renderTarget && width > 0 && height > 0) {
+    if (m_renderTarget && width > 0 && height > 0)
         m_renderTarget->Resize(D2D1::SizeU(width, height));
-    }
 }

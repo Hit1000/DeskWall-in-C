@@ -34,12 +34,10 @@ target_link_libraries(deskwall PRIVATE
     nlohmann_json::nlohmann_json
     # Windows essentials
     user32 gdi32 shell32 ole32 oleaut32
-    # Direct2D + WIC
-    d2d1 dwrite windowscodecs
-    # Direct3D 11 + DXGI
-    d3d11 dxgi
-    # Media Foundation
-    mf mfplat mfreadwrite mfuuid
+    # Direct2D + WIC (image rendering)
+    d2d1 windowscodecs
+    # Media Foundation (video rendering — HWND playback, no D3D11 needed)
+    mf mfplat mfuuid
     # Other
     shlwapi uuid
 )
