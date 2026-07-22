@@ -35,8 +35,12 @@ HWND TrayCreate(HINSTANCE hInstance, Config& config) {
 
     if (!hwnd) return nullptr;
 
-    // Load icon — try the embedded resource, fall back to a stock icon
-    HICON hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+    // Load icon at tray size (16×16). LoadImageW respects the icon's
+    // embedded sizes and picks the closest match; LoadIconW caches at
+    // system size and can serve a stale or wrong icon.
+    int iconSize = GetSystemMetrics(SM_CXSMICON);
+    HICON hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON),
+        IMAGE_ICON, iconSize, iconSize, LR_DEFAULTCOLOR);
     if (!hIcon) {
         hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_APPLICATION));
     }
