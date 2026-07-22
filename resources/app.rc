@@ -1,0 +1,8 @@
+#include <winres.h>
+#include "resource.h"
+
+// Application icon
+IDI_APPICON ICON "icon.ico"
+
+// Application manifest
+1 RT_MANIFEST "app.manifest"

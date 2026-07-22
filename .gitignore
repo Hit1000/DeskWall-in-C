@@ -1,0 +1,6 @@
+.claude/
+.claude-flow/
+build/
+.vs/
+*.user
+*.suo
