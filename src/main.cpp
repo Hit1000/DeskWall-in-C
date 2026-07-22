@@ -43,7 +43,7 @@ static void StartInjectionRetry();
 static void UpdatePauseState();
 static void ApplyWallpaper();
 static void SetStartupRegistry(bool enable);
-static bool ReadStartupRegistry();
+static void TriggerRepaint();
 
 // --- Startup registry (HKCU Run key) ---
 
@@ -55,7 +55,6 @@ static void SetStartupRegistry(bool enable) {
         if (enable) {
             wchar_t path[MAX_PATH];
             GetModuleFileNameW(nullptr, path, MAX_PATH);
-            // Quote the path
             wchar_t quoted[MAX_PATH + 2];
             StringCchPrintfW(quoted, MAX_PATH + 2, L"\"%s\"", path);
             RegSetValueExW(hKey, L"DeskWall", 0, REG_SZ,
@@ -67,21 +66,6 @@ static void SetStartupRegistry(bool enable) {
     }
 }
 
-[[maybe_unused]] static bool ReadStartupRegistry() {
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        wchar_t buf[MAX_PATH];
-        DWORD size = sizeof(buf);
-        DWORD type = 0;
-        LONG result = RegQueryValueExW(hKey, L"DeskWall", nullptr, &type, (BYTE*)buf, &size);
-        RegCloseKey(hKey);
-        return result == ERROR_SUCCESS;
-    }
-    return false;
-}
-
 // --- File picker ---
 
 static std::wstring ShowFilePicker() {
@@ -89,7 +73,6 @@ static std::wstring ShowFilePicker() {
     HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pfd));
     if (FAILED(hr)) return {};
 
-    // File type filters
     COMDLG_FILTERSPEC filters[] = {
         { L"All Supported", L"*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.mp4;*.webm;*.avi" },
         { L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.gif" },
@@ -99,30 +82,29 @@ static std::wstring ShowFilePicker() {
     pfd->SetFileTypeIndex(1);
 
     hr = pfd->Show(nullptr);
-    if (FAILED(hr)) {
-        pfd->Release();
-        return {};
-    }
+    if (FAILED(hr)) { pfd->Release(); return {}; }
 
     IShellItem* item = nullptr;
     hr = pfd->GetResult(&item);
-    if (FAILED(hr)) {
-        pfd->Release();
-        return {};
-    }
+    if (FAILED(hr)) { pfd->Release(); return {}; }
 
     PWSTR filePath = nullptr;
     item->GetDisplayName(SIGDN_FILESYSPATH, &filePath);
 
     std::wstring result;
-    if (filePath) {
-        result = filePath;
-        CoTaskMemFree(filePath);
-    }
+    if (filePath) { result = filePath; CoTaskMemFree(filePath); }
 
     item->Release();
     pfd->Release();
     return result;
+}
+
+// --- Trigger repaint ---
+
+static void TriggerRepaint() {
+    if (g_renderWindow) {
+        InvalidateRect(g_renderWindow, nullptr, FALSE);
+    }
 }
 
 // --- Apply wallpaper based on config ---
@@ -159,6 +141,7 @@ static void ApplyWallpaper() {
     }
 
     ConfigSave(g_config);
+    TriggerRepaint();
 }
 
 // --- Menu handlers (called from tray.cpp) ---
@@ -177,6 +160,7 @@ void OnMenuPauseResume() {
         if (g_videoRenderer) g_videoRenderer->Pause();
     } else {
         if (g_videoRenderer) g_videoRenderer->Resume();
+        TriggerRepaint();
     }
 }
 
@@ -192,7 +176,6 @@ void OnMenuMuteUnmute() {
 void OnMenuMonitorMode(MonitorMode mode) {
     g_config.monitorMode = mode;
     g_monitorMode = mode;
-    // Re-size render window
     RECT vr = GetVirtualScreenRect();
     SetWindowPos(g_renderWindow, nullptr,
         vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top,
@@ -236,10 +219,9 @@ static void UpdatePauseState() {
         g_paused = true;
         if (g_videoRenderer) g_videoRenderer->Pause();
     } else if (!shouldPause && g_paused && !g_fullscreenPaused && !g_batteryPaused && !g_sessionLocked) {
-        // Only auto-resume if we paused due to power/fullscreen, not user-initiated
-        // ponytail: simplified — just resume if conditions cleared
         g_paused = false;
         if (g_videoRenderer) g_videoRenderer->Resume();
+        TriggerRepaint();
     }
 }
 
@@ -247,10 +229,11 @@ static void UpdatePauseState() {
 
 static void CreateRenderWindow(HINSTANCE hInstance) {
     WNDCLASSEXW wc = { sizeof(wc) };
+    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = RenderWndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = L"DeskWallRender";
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.hbrBackground = CreateSolidBrush(0x00000000); // black background
     RegisterClassExW(&wc);
 
     RECT vr = GetVirtualScreenRect();
@@ -265,6 +248,20 @@ static void CreateRenderWindow(HINSTANCE hInstance) {
 
 static LRESULT CALLBACK RenderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_PAINT: {
+        // Render wallpaper on paint — this is the correct render path
+        if (!g_paused && g_injected) {
+            if (g_config.wallpaperType == WallpaperType::Video && g_videoRenderer) {
+                g_videoRenderer->Render();
+            } else if (g_config.wallpaperType == WallpaperType::Image && g_imageRenderer.HasImage()) {
+                g_imageRenderer.Render();
+            }
+        }
+        // Validate the paint region
+        ValidateRect(hwnd, nullptr);
+        return 0;
+    }
+
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
             UINT w = LOWORD(lParam);
@@ -275,7 +272,6 @@ static LRESULT CALLBACK RenderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
 
     case WM_DISPLAYCHANGE: {
-        // Resolution or monitor topology changed — re-size
         RECT vr = GetVirtualScreenRect();
         SetWindowPos(hwnd, nullptr,
             vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top,
@@ -286,13 +282,11 @@ static LRESULT CALLBACK RenderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// --- Tray window (subclass to handle tray messages and menu) ---
+// --- Tray window ---
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TASKBAR_CREATED) {
-        // Explorer restarted — re-inject
         OnExplorerRestarted(g_renderWindow);
-        // Tray icon was lost when Explorer restarted — recreate it
         TrayDestroy(g_trayWindow);
         g_trayWindow = TrayCreate(g_hInstance, g_config);
         SetWindowLongPtrW(g_trayWindow, GWLP_WNDPROC, (LONG_PTR)TrayWndProc);
@@ -316,6 +310,15 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case IDM_MONITOR_PERMONITOR: OnMenuMonitorMode(MonitorMode::PerMonitor); break;
         case IDM_START_WITH_WINDOWS: OnMenuStartWithWindows(!g_startWithWindows); break;
         case IDM_EXIT: OnMenuExit(); break;
+        }
+        return 0;
+    }
+
+    if (msg == WM_TIMER) {
+        UpdatePauseState();
+        // For video wallpapers, continuously trigger repaints
+        if (!g_paused && g_injected && g_config.wallpaperType == WallpaperType::Video) {
+            TriggerRepaint();
         }
         return 0;
     }
@@ -344,46 +347,33 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 // --- Entry point ---
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
-    // Single instance check
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Global\\DeskWallMutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        return 0; // Already running
-    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     g_hInstance = hInstance;
 
-    // Skip injection over Remote Desktop
     if (IsRemoteDesktopSession()) {
-        // Still show tray, but no rendering
         LogMessage(L"Running in Remote Desktop session — rendering disabled");
     }
 
-    // Initialize COM for file picker and WIC
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    // Register TaskbarCreated message
     WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
 
-    // Load config
     g_config = ConfigLoad();
     g_muted = g_config.muted;
     g_monitorMode = g_config.monitorMode;
     g_startWithWindows = g_config.startWithWindows;
 
-    // Sync startup registry with config
     SetStartupRegistry(g_config.startWithWindows);
 
-    // Create windows
+    // Create the render window first (WS_POPUP, not yet parented)
     CreateRenderWindow(hInstance);
     g_trayWindow = TrayCreate(hInstance, g_config);
-
-    // Subclass tray window to handle our messages
     SetWindowLongPtrW(g_trayWindow, GWLP_WNDPROC, (LONG_PTR)TrayWndProc);
-
-    // Register for session notifications
     RegisterSessionNotifications(g_trayWindow);
 
-    // Show render window (hidden behind desktop icons once injected)
+    // Show render window before injection (needed for raised desktop Z-order)
     ShowWindow(g_renderWindow, SW_SHOWNOACTIVATE);
 
     // Try injection with retry loop for 24H2
@@ -394,28 +384,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     // Load wallpaper if configured
     ApplyWallpaper();
 
-    // Timer for periodic checks (fullscreen, battery)
-    SetTimer(g_trayWindow, 1, 2000, nullptr); // every 2 seconds
+    // Timer for periodic checks (fullscreen, battery) and video frame updates
+    SetTimer(g_trayWindow, 1, 33, nullptr); // ~30fps for video repaints
 
-    // Message loop
+    // Message loop — render is driven by WM_PAINT, triggered by Timer/InvalidateRect
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
-        // Forward timer messages to tray window proc
-        if (msg.message == WM_TIMER && msg.hwnd == g_trayWindow) {
-            UpdatePauseState();
-        }
-
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
-
-        // Render frame
-        if (!g_paused && g_injected) {
-            if (g_config.wallpaperType == WallpaperType::Video && g_videoRenderer) {
-                g_videoRenderer->Render();
-            } else if (g_config.wallpaperType == WallpaperType::Image && g_imageRenderer.HasImage()) {
-                g_imageRenderer.Render();
-            }
-        }
     }
 
     // Cleanup
@@ -430,30 +406,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     DestroyWindow(g_renderWindow);
     CoUninitialize();
 
-    if (hMutex) {
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
-    }
-
+    if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
     return 0;
 }
 
 // --- Injection retry ---
 
 static void StartInjectionRetry() {
-    // Try up to 20 times over 10 seconds
     for (int i = 0; i < 20; i++) {
         if (TryInjectWallpaperWindow(g_renderWindow)) {
             g_injected = true;
-            // Re-size to match WorkerW
-            RECT vr = GetVirtualScreenRect();
-            SetWindowPos(g_renderWindow, nullptr,
-                vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top,
-                SWP_NOZORDER | SWP_NOACTIVATE);
+            TriggerRepaint();
             return;
         }
         Sleep(500);
-        // Process messages during retry so tray icon still works
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);

@@ -1,70 +1,164 @@
 #include "workerw.h"
 #include "config.h"
-#include <vector>
 
-static HWND g_workerw = nullptr;
+static InjectionResult g_injection = {};
+static bool g_injected = false;
+
+const InjectionResult* GetInjectionState() {
+    return g_injected ? &g_injection : nullptr;
+}
 
 struct EnumWindowsData {
-    HWND workerw;
+    HWND progmanLike;  // Window hosting SHELLDLL_DefView
+    HWND defView;      // The SHELLDLL_DefView itself
+    HWND workerw;      // The WorkerW sibling (or child)
 };
 
 static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     auto* data = reinterpret_cast<EnumWindowsData*>(lParam);
     HWND defView = FindWindowExW(hwnd, nullptr, L"SHELLDLL_DefView", nullptr);
     if (defView) {
-        // Found the parent with SHELLDLL_DefView — its next Z-order sibling is the WorkerW we want.
-        data->workerw = FindWindowExW(nullptr, hwnd, L"WorkerW", nullptr);
+        data->progmanLike = hwnd;
+        data->defView = defView;
+
+        // Classic shell: WorkerW is a top-level sibling of the DefView host.
+        HWND sibling = FindWindowExW(nullptr, hwnd, L"WorkerW", nullptr);
+        if (sibling) {
+            data->workerw = sibling;
+        } else {
+            // Nested/raised-desktop: WorkerW is a direct child of the DefView host.
+            data->workerw = FindWindowExW(hwnd, nullptr, L"WorkerW", nullptr);
+        }
     }
-    return TRUE; // continue enumerating
+    return TRUE;
 }
 
 bool TryInjectWallpaperWindow(HWND renderWindow) {
     HWND progman = FindWindowW(L"Progman", nullptr);
-    if (!progman) {
-        LogMessage(L"WorkerW: Progman window not found");
-        return false;
+
+    if (progman) {
+        // Send the undocumented message to spawn a WorkerW behind icons.
+        // Use wParam=0xD, lParam=1 (Lively's variant — more reliable on newer builds).
+        // Use SendMessageTimeoutW so we never hang if Explorer doesn't respond.
+        // Send twice with a pause for Windows 11 24H2 compatibility.
+        DWORD_PTR result = 0;
+        SendMessageTimeoutW(progman, 0x052C, (WPARAM)0xD, (LPARAM)1, SMTO_NORMAL, 1000, &result);
+        Sleep(1000);
+        SendMessageTimeoutW(progman, 0x052C, (WPARAM)0xD, (LPARAM)1, SMTO_NORMAL, 1000, &result);
+    } else {
+        LogMessage(L"WorkerW: FindWindowW(Progman) failed; still trying enumeration");
     }
 
-    // Send the undocumented message to spawn a WorkerW behind icons.
-    // Use SendMessageTimeoutW so we never hang if Explorer doesn't respond.
-    // Send twice with a pause for Windows 11 24H2 compatibility.
-    DWORD_PTR result = 0;
-    SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, &result);
-    Sleep(1000);
-    SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, &result);
+    // Check for "raised desktop" — Progman with WS_EX_NOREDIRECTIONBITMAP
+    bool raisedDesktop = false;
+    if (progman) {
+        LONG exStyle = GetWindowLongW(progman, GWL_EXSTYLE);
+        raisedDesktop = (exStyle & WS_EX_NOREDIRECTIONBITMAP) != 0;
+        if (raisedDesktop) {
+            LogMessage(L"WorkerW: Detected raised desktop (WS_EX_NOREDIRECTIONBITMAP)");
+        }
+    }
 
-    // Enumerate to find the WorkerW that sits behind the icons.
+    // Enumerate to find the DefView host and WorkerW.
     EnumWindowsData data{};
-    data.workerw = nullptr;
     EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&data));
 
+    if (raisedDesktop) {
+        // Microsoft's "raised desktop" architecture: Progman has no GDI surface;
+        // SHELLDLL_DefView is a WS_EX_LAYERED child of Progman; a WorkerW child
+        // renders the wallpaper beneath it. Attach directly to Progman,
+        // Z-ordered between DefView and WorkerW.
+        if (!data.defView) {
+            LogMessage(L"WorkerW: Raised desktop but no SHELLDLL_DefView found");
+            return false;
+        }
+
+        g_injection.parent = data.progmanLike;
+        g_injection.insertAfter = data.defView;
+        g_injection.needsLayered = true;
+        g_injection.systemWorkerW = data.workerw ? data.workerw : nullptr;
+        g_injected = true;
+
+        // Create as WS_CHILD of Progman with WS_EX_LAYERED
+        SetWindowLongW(renderWindow, GWL_STYLE, GetWindowLongW(renderWindow, GWL_STYLE) | WS_CHILD);
+        SetWindowLongW(renderWindow, GWL_EXSTYLE,
+            GetWindowLongW(renderWindow, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+        SetParent(renderWindow, data.progmanLike);
+        SetLayeredWindowAttributes(renderWindow, 0, 255, LWA_ALPHA);
+
+        // Size to cover the full virtual desktop
+        RECT vr = GetVirtualScreenRect();
+        SetWindowPos(renderWindow, nullptr,
+            vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+
+        // Z-order: sit right after SHELLDLL_DefView
+        SetWindowPos(renderWindow, data.defView,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+        // Push the system WorkerW behind us
+        if (data.workerw) {
+            SetWindowPos(data.workerw, renderWindow,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        ShowWindow(renderWindow, SW_SHOWNOACTIVATE);
+        InvalidateRect(renderWindow, nullptr, TRUE);
+        UpdateWindow(renderWindow);
+
+        LogMessage(L"WorkerW: Raised desktop injection successful");
+        return true;
+    }
+
+    // Classic shell path
     if (!data.workerw) {
         LogMessage(L"WorkerW: Could not find WorkerW window");
         return false;
     }
 
-    g_workerw = data.workerw;
+    g_injection.parent = data.workerw;
+    g_injection.insertAfter = nullptr;
+    g_injection.needsLayered = false;
+    g_injection.systemWorkerW = nullptr;
+    g_injected = true;
 
-    // Parent our render window into the WorkerW layer.
-    SetParent(renderWindow, g_workerw);
+    SetParent(renderWindow, data.workerw);
 
-    // Size to cover the full virtual desktop.
+    // Size and position to cover the full virtual desktop
     RECT vr = GetVirtualScreenRect();
     SetWindowPos(renderWindow, nullptr,
         vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top,
         SWP_NOZORDER | SWP_NOACTIVATE);
 
-    LogMessage(L"WorkerW: Injection successful");
+    ShowWindow(renderWindow, SW_SHOWNOACTIVATE);
+    SetWindowPos(renderWindow, HWND_BOTTOM,
+        0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    InvalidateRect(renderWindow, nullptr, TRUE);
+    UpdateWindow(renderWindow);
+
+    LogMessage(L"WorkerW: Classic injection successful");
     return true;
 }
 
 void OnExplorerRestarted(HWND renderWindow) {
     LogMessage(L"WorkerW: Explorer restarted, re-injecting...");
-    // Unparent first in case the old WorkerW is gone.
+    // Unparent first
     SetParent(renderWindow, nullptr);
-    g_workerw = nullptr;
+    g_injected = false;
+    g_injection = {};
 
-    // Retry loop for 24H2 compatibility.
+    // Restore window styles
+    LONG style = GetWindowLongW(renderWindow, GWL_STYLE);
+    style &= ~WS_CHILD;
+    SetWindowLongW(renderWindow, GWL_STYLE, style);
+    LONG exStyle = GetWindowLongW(renderWindow, GWL_EXSTYLE);
+    exStyle &= ~(WS_EX_LAYERED);
+    SetWindowLongW(renderWindow, GWL_EXSTYLE, exStyle);
+
+    // Retry loop for 24H2 compatibility
     for (int i = 0; i < 20; i++) {
         if (TryInjectWallpaperWindow(renderWindow)) return;
         Sleep(500);
