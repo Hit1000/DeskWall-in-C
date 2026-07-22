@@ -249,7 +249,8 @@ static void CreateRenderWindow(HINSTANCE hInstance) {
 static LRESULT CALLBACK RenderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_PAINT: {
-        // Render wallpaper on paint — this is the correct render path
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
         if (!g_paused && g_injected) {
             if (g_config.wallpaperType == WallpaperType::Video && g_videoRenderer) {
                 g_videoRenderer->Render();
@@ -257,8 +258,7 @@ static LRESULT CALLBACK RenderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 g_imageRenderer.Render();
             }
         }
-        // Validate the paint region
-        ValidateRect(hwnd, nullptr);
+        EndPaint(hwnd, &ps);
         return 0;
     }
 

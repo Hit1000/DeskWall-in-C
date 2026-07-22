@@ -24,7 +24,7 @@ bool ImageRenderer::Initialize(HWND hwnd) {
         return false;
     }
 
-    return CreateRenderTarget();
+    return true;
 }
 
 void ImageRenderer::Shutdown() {
@@ -34,21 +34,32 @@ void ImageRenderer::Shutdown() {
     if (m_factory) { m_factory->Release(); m_factory = nullptr; }
 }
 
-bool ImageRenderer::CreateRenderTarget() {
+bool ImageRenderer::CreateRenderTarget(UINT width, UINT height) {
     if (m_renderTarget) {
         m_renderTarget->Release();
         m_renderTarget = nullptr;
     }
 
-    RECT rc;
-    GetClientRect(m_hwnd, &rc);
+    // Use explicit size — GetClientRect can return 0x0 before the parent
+    // lays out the child window.
+    if (width == 0 || height == 0) {
+        RECT rc;
+        GetClientRect(m_hwnd, &rc);
+        width = rc.right - rc.left;
+        height = rc.bottom - rc.top;
+    }
 
-    D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+    if (width == 0 || height == 0) {
+        LogMessage(L"ImageRenderer: Render target size is 0x0");
+        return false;
+    }
+
+    D2D1_SIZE_U size = D2D1::SizeU(width, height);
 
     HRESULT hr = m_factory->CreateHwndRenderTarget(
         D2D1::RenderTargetProperties(),
         D2D1::HwndRenderTargetProperties(m_hwnd, size,
-            D2D1_PRESENT_OPTIONS_IMMEDIATELY),
+            D2D1_PRESENT_OPTIONS_NONE),
         &m_renderTarget);
 
     if (FAILED(hr)) {
@@ -59,7 +70,7 @@ bool ImageRenderer::CreateRenderTarget() {
 }
 
 bool ImageRenderer::LoadImageFile(const std::wstring& path) {
-    if (!m_wicFactory || !m_renderTarget) return false;
+    if (!m_wicFactory) return false;
 
     // Release old bitmap
     if (m_bitmap) {
@@ -67,10 +78,21 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
         m_bitmap = nullptr;
     }
 
+    // Get window size for render target
+    RECT rc;
+    GetClientRect(m_hwnd, &rc);
+    UINT rtWidth = rc.right - rc.left;
+    UINT rtHeight = rc.bottom - rc.top;
+
+    // Create render target if needed
+    if (!m_renderTarget) {
+        if (!CreateRenderTarget(rtWidth, rtHeight)) return false;
+    }
+
     IWICBitmapDecoder* decoder = nullptr;
     HRESULT hr = m_wicFactory->CreateDecoderFromFilename(
         path.c_str(), nullptr, GENERIC_READ,
-        WICDecodeMetadataCacheOnLoad, &decoder);
+        WICDecodeMetadataCacheOnDemand, &decoder);
     if (FAILED(hr)) {
         LogMessage(L"ImageRenderer: CreateDecoderFromFilename failed for: " + path);
         return false;
@@ -88,12 +110,26 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
     hr = m_wicFactory->CreateFormatConverter(&converter);
     if (SUCCEEDED(hr)) {
         hr = converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA,
-            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
-    }
-    if (SUCCEEDED(hr)) {
-        hr = m_renderTarget->CreateBitmapFromWicBitmap(converter, nullptr, &m_bitmap);
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeMedianCut);
     }
 
+    // Scale to window size to save memory (like Rust version)
+    IWICBitmapScaler* scaler = nullptr;
+    if (SUCCEEDED(hr) && rtWidth > 0 && rtHeight > 0) {
+        hr = m_wicFactory->CreateBitmapScaler(&scaler);
+        if (SUCCEEDED(hr)) {
+            hr = scaler->Initialize(converter, rtWidth, rtHeight,
+                WICBitmapInterpolationModeFant);
+        }
+    }
+
+    if (SUCCEEDED(hr)) {
+        // Use scaler if available, otherwise converter
+        IWICBitmapSource* source = scaler ? (IWICBitmapSource*)scaler : (IWICBitmapSource*)converter;
+        hr = m_renderTarget->CreateBitmapFromWicBitmap(source, nullptr, &m_bitmap);
+    }
+
+    if (scaler) scaler->Release();
     if (converter) converter->Release();
     if (frame) frame->Release();
     if (decoder) decoder->Release();
@@ -106,35 +142,22 @@ bool ImageRenderer::LoadImageFile(const std::wstring& path) {
     return true;
 }
 
-void ImageRenderer::DrawImage() {
+void ImageRenderer::Render() {
     if (!m_renderTarget || !m_bitmap) return;
 
+    m_renderTarget->BeginDraw();
+    m_renderTarget->Clear(D2D1::ColorF(0x1a1a2e));
+
     D2D1_SIZE_F rtSize = m_renderTarget->GetSize();
-    D2D1_SIZE_F bmpSize = m_bitmap->GetSize();
-
-    // Stretch to fill while maintaining aspect ratio (cover mode)
-    float scaleX = rtSize.width / bmpSize.width;
-    float scaleY = rtSize.height / bmpSize.height;
-    float scale = (scaleX > scaleY) ? scaleX : scaleY;
-
-    float drawW = bmpSize.width * scale;
-    float drawH = bmpSize.height * scale;
-    float offsetX = (rtSize.width - drawW) / 2.0f;
-    float offsetY = (rtSize.height - drawH) / 2.0f;
-
-    D2D1_RECT_F destRect = D2D1::RectF(offsetX, offsetY, offsetX + drawW, offsetY + drawH);
+    D2D1_RECT_F destRect = D2D1::RectF(0, 0, rtSize.width, rtSize.height);
 
     m_renderTarget->DrawBitmap(m_bitmap, destRect, 1.0f,
         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-}
 
-void ImageRenderer::Render() {
-    if (!m_renderTarget) return;
-
-    m_renderTarget->BeginDraw();
-    m_renderTarget->Clear(D2D1::ColorF(0x1a1a2e)); // dark background fallback
-    DrawImage();
-    m_renderTarget->EndDraw();
+    HRESULT hr = m_renderTarget->EndDraw();
+    if (FAILED(hr)) {
+        LogMessage(L"ImageRenderer: EndDraw failed");
+    }
 }
 
 void ImageRenderer::OnResize(UINT width, UINT height) {

@@ -34,19 +34,19 @@ static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
 }
 
 bool TryInjectWallpaperWindow(HWND renderWindow) {
+    // Progman lookup is best-effort: on raised desktop shells,
+    // FindWindowW("Progman") can fail even though EnumWindows can still
+    // find the DefView host. Don't bail out on failure.
     HWND progman = FindWindowW(L"Progman", nullptr);
 
     if (progman) {
-        // Send the undocumented message to spawn a WorkerW behind icons.
-        // Use wParam=0xD, lParam=1 (Lively's variant — more reliable on newer builds).
-        // Use SendMessageTimeoutW so we never hang if Explorer doesn't respond.
-        // Send twice with a pause for Windows 11 24H2 compatibility.
+        // wParam=0xD, lParam=1 — Lively's variant, more reliable on newer builds.
         DWORD_PTR result = 0;
         SendMessageTimeoutW(progman, 0x052C, (WPARAM)0xD, (LPARAM)1, SMTO_NORMAL, 1000, &result);
         Sleep(1000);
         SendMessageTimeoutW(progman, 0x052C, (WPARAM)0xD, (LPARAM)1, SMTO_NORMAL, 1000, &result);
     } else {
-        LogMessage(L"WorkerW: FindWindowW(Progman) failed; still trying enumeration");
+        LogMessage(L"WorkerW: FindWindowW(Progman) failed; skipping spawn, trying enumeration");
     }
 
     // Check for "raised desktop" — Progman with WS_EX_NOREDIRECTIONBITMAP
@@ -63,16 +63,16 @@ bool TryInjectWallpaperWindow(HWND renderWindow) {
     EnumWindowsData data{};
     EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&data));
 
+    if (!data.defView) {
+        LogMessage(L"WorkerW: No SHELLDLL_DefView found in enumeration");
+        return false;
+    }
+
     if (raisedDesktop) {
         // Microsoft's "raised desktop" architecture: Progman has no GDI surface;
         // SHELLDLL_DefView is a WS_EX_LAYERED child of Progman; a WorkerW child
         // renders the wallpaper beneath it. Attach directly to Progman,
         // Z-ordered between DefView and WorkerW.
-        if (!data.defView) {
-            LogMessage(L"WorkerW: Raised desktop but no SHELLDLL_DefView found");
-            return false;
-        }
-
         g_injection.parent = data.progmanLike;
         g_injection.insertAfter = data.defView;
         g_injection.needsLayered = true;
@@ -80,7 +80,8 @@ bool TryInjectWallpaperWindow(HWND renderWindow) {
         g_injected = true;
 
         // Create as WS_CHILD of Progman with WS_EX_LAYERED
-        SetWindowLongW(renderWindow, GWL_STYLE, GetWindowLongW(renderWindow, GWL_STYLE) | WS_CHILD);
+        SetWindowLongW(renderWindow, GWL_STYLE,
+            (GetWindowLongW(renderWindow, GWL_STYLE) & ~WS_POPUP) | WS_CHILD);
         SetWindowLongW(renderWindow, GWL_EXSTYLE,
             GetWindowLongW(renderWindow, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
         SetParent(renderWindow, data.progmanLike);
@@ -114,7 +115,7 @@ bool TryInjectWallpaperWindow(HWND renderWindow) {
 
     // Classic shell path
     if (!data.workerw) {
-        LogMessage(L"WorkerW: Could not find WorkerW window");
+        LogMessage(L"WorkerW: SHELLDLL_DefView found but no WorkerW sibling or child");
         return false;
     }
 
@@ -126,7 +127,6 @@ bool TryInjectWallpaperWindow(HWND renderWindow) {
 
     SetParent(renderWindow, data.workerw);
 
-    // Size and position to cover the full virtual desktop
     RECT vr = GetVirtualScreenRect();
     SetWindowPos(renderWindow, nullptr,
         vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top,
@@ -145,7 +145,6 @@ bool TryInjectWallpaperWindow(HWND renderWindow) {
 
 void OnExplorerRestarted(HWND renderWindow) {
     LogMessage(L"WorkerW: Explorer restarted, re-injecting...");
-    // Unparent first
     SetParent(renderWindow, nullptr);
     g_injected = false;
     g_injection = {};
@@ -153,12 +152,12 @@ void OnExplorerRestarted(HWND renderWindow) {
     // Restore window styles
     LONG style = GetWindowLongW(renderWindow, GWL_STYLE);
     style &= ~WS_CHILD;
+    style |= WS_POPUP;
     SetWindowLongW(renderWindow, GWL_STYLE, style);
     LONG exStyle = GetWindowLongW(renderWindow, GWL_EXSTYLE);
     exStyle &= ~(WS_EX_LAYERED);
     SetWindowLongW(renderWindow, GWL_EXSTYLE, exStyle);
 
-    // Retry loop for 24H2 compatibility
     for (int i = 0; i < 20; i++) {
         if (TryInjectWallpaperWindow(renderWindow)) return;
         Sleep(500);

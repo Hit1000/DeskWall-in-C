@@ -30,6 +30,6 @@ private:
     ID2D1Bitmap* m_bitmap = nullptr;
     IWICImagingFactory* m_wicFactory = nullptr;
 
-    bool CreateRenderTarget();
+    bool CreateRenderTarget(UINT width = 0, UINT height = 0);
     void DrawImage();
 };
