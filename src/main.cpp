@@ -24,6 +24,7 @@ static bool g_injected = false;
 static bool g_sessionLocked = false;
 static bool g_fullscreenPaused = false;
 static bool g_batteryPaused = false;
+static int g_injectRetryCount = 0;
 
 bool g_paused = false;
 bool g_muted = true;
@@ -38,6 +39,36 @@ static void UpdatePauseState();
 static void ApplyWallpaper();
 static void SetStartupRegistry(bool enable);
 static void TriggerRepaint();
+static void DeferredInject(HWND hwnd, UINT msg, UINT_PTR id, DWORD dwTime);
+
+// Detect when the desktop itself (Program Manager / Explorer desktop window) is
+// in the foreground. The desktop window typically has WS_CAPTION set, but
+// IsFullscreenAppInForeground() checks for the ABSENCE of WS_CAPTION — so a
+// desktop without WS_CAPTION (some Windows 11 configurations) would be
+// misidentified as a fullscreen app, causing the wallpaper to freeze.
+static bool IsDesktopForeground() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+
+    // Exclude our own windows
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    if (fgPid == GetCurrentProcessId()) return false;
+
+    wchar_t className[64] = {};
+    GetClassNameW(fg, className, 64);
+
+    // Progman is the classic desktop shell window
+    if (wcscmp(className, L"Progman") == 0) return true;
+
+    // WorkerW is the hidden window behind the desktop icons
+    if (wcscmp(className, L"WorkerW") == 0) return true;
+
+    // Some setups use a "DesktopWindowClass" or similar
+    if (wcsstr(className, L"Desktop") != nullptr) return true;
+
+    return false;
+}
 
 // --- Startup registry ---
 
@@ -93,7 +124,14 @@ static std::wstring ShowFilePicker() {
 }
 
 static void TriggerRepaint() {
-    if (g_renderWindow) InvalidateRect(g_renderWindow, nullptr, FALSE);
+    if (g_renderWindow) {
+        // Use RedrawWindow with RDW_INVALIDATE | RDW_NOERASE for reliable
+        // paint delivery even when the desktop window is in the foreground.
+        // Plain InvalidateRect can be deferred by Windows when the window
+        // is behind the active desktop shell window.
+        RedrawWindow(g_renderWindow, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN);
+    }
 }
 
 // --- Apply wallpaper ---
@@ -149,6 +187,7 @@ void OnMenuPauseResume() {
         if (g_videoRenderer) g_videoRenderer->Resume();
         TriggerRepaint();
     }
+    TrayUpdateIcon(g_trayWindow, g_paused);
 }
 
 void OnMenuMuteUnmute() {
@@ -184,7 +223,9 @@ void OnMenuExit() {
 static void UpdatePauseState() {
     bool shouldPause = false;
 
-    if (g_config.pauseOnFullscreenApp && IsFullscreenAppInForeground()) {
+    // Don't treat the desktop itself as a fullscreen app — the wallpaper
+    // should keep running when the user is looking at the desktop.
+    if (g_config.pauseOnFullscreenApp && IsFullscreenAppInForeground() && !IsDesktopForeground()) {
         shouldPause = true;
         g_fullscreenPaused = true;
     } else {
@@ -203,10 +244,12 @@ static void UpdatePauseState() {
     if (shouldPause && !g_paused) {
         g_paused = true;
         if (g_videoRenderer) g_videoRenderer->Pause();
+        TrayUpdateIcon(g_trayWindow, true);
     } else if (!shouldPause && g_paused && !g_fullscreenPaused && !g_batteryPaused && !g_sessionLocked) {
         g_paused = false;
         if (g_videoRenderer) g_videoRenderer->Resume();
         TriggerRepaint();
+        TrayUpdateIcon(g_trayWindow, false);
     }
 }
 
@@ -276,6 +319,39 @@ static LRESULT CALLBACK RenderWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// --- Deferred injection (non-blocking startup) ---
+
+static void DeferredInject(HWND hwnd, UINT, UINT_PTR, DWORD) {
+    InjectionResult injection = FindInjectionTarget();
+
+    if (!injection.found) {
+        g_injectRetryCount++;
+        if (g_injectRetryCount >= 20) {
+            // Give up after 10 seconds — app runs without desktop injection
+            KillTimer(hwnd, 2);
+            LogMessage(L"Main: Injection target not found after 10s, giving up");
+        }
+        return;
+    }
+
+    // Found the injection target — stop the retry timer
+    KillTimer(hwnd, 2);
+
+    // Create the render window with styles matched to the injection target
+    g_renderWindow = CreateRenderWindow(g_hInstance, &injection);
+
+    // Apply injection (parent into WorkerW/Progman)
+    g_injected = ApplyInjection(g_renderWindow, injection);
+    if (g_injected) {
+        LogMessage(L"Main: Injection applied successfully");
+    } else {
+        LogMessage(L"Main: ApplyInjection failed");
+    }
+
+    // Load wallpaper now that the render window exists
+    ApplyWallpaper();
+}
+
 // --- Tray window ---
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -306,7 +382,9 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_TIMER) {
         UpdatePauseState();
-        if (!g_paused && g_injected && g_config.wallpaperType == WallpaperType::Video)
+        // Drive repaints for BOTH video and image wallpapers so the
+        // desktop wallpaper never freezes regardless of focus state.
+        if (!g_paused && g_injected)
             TriggerRepaint();
         return 0;
     }
@@ -342,39 +420,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_startWithWindows = g_config.startWithWindows;
     SetStartupRegistry(g_config.startWithWindows);
 
-    // Step 1: Find injection target BEFORE creating the render window
-    InjectionResult injection = {};
-    if (!IsRemoteDesktopSession()) {
-        for (int i = 0; i < 20; i++) {
-            injection = FindInjectionTarget();
-            if (injection.found) break;
-            Sleep(500);
-        }
-    }
-
-    // Step 2: Create render window with correct styles for the injection target
-    g_renderWindow = CreateRenderWindow(hInstance, injection.found ? &injection : nullptr);
-
-    // Step 3: Create tray
+    // Step 1: Create tray IMMEDIATELY — no blocking waits.
+    // The tray icon appears instantly on startup.
     g_trayWindow = TrayCreate(hInstance, g_config);
     SetWindowLongPtrW(g_trayWindow, GWLP_WNDPROC, (LONG_PTR)TrayWndProc);
     RegisterSessionNotifications(g_trayWindow);
 
-    // Step 4: Apply injection (parent into WorkerW/Progman)
-    if (injection.found) {
-        g_injected = ApplyInjection(g_renderWindow, injection);
-        if (g_injected) {
-            LogMessage(L"Main: Injection applied successfully");
-        } else {
-            LogMessage(L"Main: ApplyInjection failed");
-        }
-    }
-
-    // Step 5: Load wallpaper
-    ApplyWallpaper();
-
-    // Timer for pause checks + video frame updates
+    // Timer for pause checks + frame updates (drives both video and image wallpapers)
     SetTimer(g_trayWindow, 1, 33, nullptr);
+
+    // Step 2: Defer injection to a timer callback. This avoids blocking the
+    // main thread with Sleep() loops while Explorer's desktop is still
+    // initializing during Windows startup.
+    if (!IsRemoteDesktopSession()) {
+        g_injectRetryCount = 0;
+        SetTimer(g_trayWindow, 2, 500, DeferredInject);
+    }
 
     // Message loop
     MSG msg;
@@ -384,11 +445,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     }
 
     KillTimer(g_trayWindow, 1);
+    KillTimer(g_trayWindow, 2); // Stop deferred injection timer if still running
     UnregisterSessionNotifications(g_trayWindow);
     g_imageRenderer.Shutdown();
     if (g_videoRenderer) { g_videoRenderer->Shutdown(); g_videoRenderer->Release(); }
     TrayDestroy(g_trayWindow);
-    DestroyWindow(g_renderWindow);
+    if (g_renderWindow) DestroyWindow(g_renderWindow);
     CoUninitialize();
     if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
     return 0;

@@ -35,12 +35,14 @@ HWND TrayCreate(HINSTANCE hInstance, Config& config) {
 
     if (!hwnd) return nullptr;
 
-    // Load icon at 32×32 — the 16×16 entry in some ICO files has
-    // palette/format issues that render as solid orange in the small
-    // tray view. Loading 32×32 and letting Windows scale down looks
-    // correct in both small and large notification area views.
-    HICON hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON),
-        IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+    // Extract icon from the exe — this always reads the latest embedded
+    // resource, bypassing any shell icon cache that LoadImageW can hit.
+    HICON hIcon = ExtractIconW(hInstance, L"deskwall.exe", 0);
+    if (!hIcon || hIcon == (HICON)1) {
+        // Fallback: load at 32×32 via LoadImageW
+        hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON),
+            IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+    }
     if (!hIcon) {
         hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_APPLICATION));
     }
@@ -75,7 +77,8 @@ void TraySetTooltip(HWND hwnd, const std::wstring& text) {
 
 void TrayUpdateIcon(HWND hwnd, bool paused) {
     g_nid.hWnd = hwnd;
-    // Could swap icon for paused state if desired — for now just update tooltip
+    // Update tooltip to reflect current state
+    wcscpy_s(g_nid.szTip, paused ? L"DeskWall (Paused)" : L"DeskWall");
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
