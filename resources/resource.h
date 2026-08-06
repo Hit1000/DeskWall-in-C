@@ -1,4 +1,7 @@
 #pragma once
 
-#define IDI_APPICON 101
-#define WM_TRAYICON (WM_APP + 1)
+// Icon
+#define IDI_APPICON  101
+
+// Tray custom message
+#define WM_TRAYICON  (WM_APP + 1)
