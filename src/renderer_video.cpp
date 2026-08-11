@@ -2,10 +2,6 @@
 #include "config.h"
 #include <shlwapi.h>
 
-#pragma comment(lib, "mf.lib")
-#pragma comment(lib, "mfplat.lib")
-#pragma comment(lib, "mfuuid.lib")
-
 VideoRenderer::VideoRenderer() {}
 VideoRenderer::~VideoRenderer() { Shutdown(); }
 
@@ -137,6 +133,8 @@ void VideoRenderer::OnResize(UINT, UINT) {
 }
 
 void VideoRenderer::Shutdown() {
+    if (m_shutdownCalled) return;
+    m_shutdownCalled = true;
     if (m_mediaEngine) {
         m_mediaEngine->Shutdown();
         m_mediaEngine->Release();

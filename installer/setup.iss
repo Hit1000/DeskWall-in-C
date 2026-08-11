@@ -24,6 +24,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
+; No VC++ redistributable required — the app is built with /MT (static CRT),
+; so all runtime dependencies are linked into the binary.
 Source: "..\build\Release\deskwall.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

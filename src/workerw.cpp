@@ -9,6 +9,10 @@ struct EnumWindowsData {
 
 static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     auto* data = reinterpret_cast<EnumWindowsData*>(lParam);
+    // Skip if we already found the desktop SHELLDLL_DefView — don't overwrite
+    // with a later match from another Explorer window or third-party shell.
+    if (data->defView) return TRUE;
+
     HWND defView = FindWindowExW(hwnd, nullptr, L"SHELLDLL_DefView", nullptr);
     if (defView) {
         data->progmanLike = hwnd;
@@ -30,8 +34,11 @@ InjectionResult FindInjectionTarget() {
 
     if (progman) {
         DWORD_PTR sendResult = 0;
+        // The undocumented 0x052C message spawns a WorkerW window behind the
+        // desktop. Sending it twice is a known workaround. The brief sleep
+        // gives Explorer time to process the first message before the second.
         SendMessageTimeoutW(progman, 0x052C, (WPARAM)0xD, (LPARAM)1, SMTO_NORMAL, 1000, &sendResult);
-        Sleep(1000);
+        Sleep(200);
         SendMessageTimeoutW(progman, 0x052C, (WPARAM)0xD, (LPARAM)1, SMTO_NORMAL, 1000, &sendResult);
     } else {
         LogMessage(L"WorkerW: FindWindowW(Progman) failed; skipping spawn, trying enumeration");
@@ -123,7 +130,7 @@ bool TryInjectWallpaperWindow(HWND renderWindow) {
     return ApplyInjection(renderWindow, injection);
 }
 
-void OnExplorerRestarted(HWND renderWindow) {
+bool ReInjectAfterExplorerRestart(HWND renderWindow) {
     LogMessage(L"WorkerW: Explorer restarted, re-injecting...");
     SetParent(renderWindow, nullptr);
 
@@ -136,23 +143,22 @@ void OnExplorerRestarted(HWND renderWindow) {
     exStyle &= ~(WS_EX_LAYERED);
     SetWindowLongW(renderWindow, GWL_EXSTYLE, exStyle);
 
-    for (int i = 0; i < 20; i++) {
-        InjectionResult injection = FindInjectionTarget();
-        if (injection.found) {
-            // For raised desktop, recreate with correct styles
-            if (injection.needsLayered) {
-                SetWindowLongW(renderWindow, GWL_STYLE,
-                    (GetWindowLongW(renderWindow, GWL_STYLE) & ~WS_POPUP) | WS_CHILD);
-                SetWindowLongW(renderWindow, GWL_EXSTYLE,
-                    GetWindowLongW(renderWindow, GWL_EXSTYLE) | WS_EX_LAYERED);
-                SetParent(renderWindow, injection.parent);
-            }
-            ApplyInjection(renderWindow, injection);
-            return;
-        }
-        Sleep(500);
+    InjectionResult injection = FindInjectionTarget();
+    if (!injection.found) {
+        LogMessage(L"WorkerW: Re-injection target not found yet");
+        return false;
     }
-    LogMessage(L"WorkerW: Re-injection failed after Explorer restart");
+
+    // For raised desktop, recreate with correct styles
+    if (injection.needsLayered) {
+        SetWindowLongW(renderWindow, GWL_STYLE,
+            (GetWindowLongW(renderWindow, GWL_STYLE) & ~WS_POPUP) | WS_CHILD);
+        SetWindowLongW(renderWindow, GWL_EXSTYLE,
+            GetWindowLongW(renderWindow, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetParent(renderWindow, injection.parent);
+    }
+    ApplyInjection(renderWindow, injection);
+    return true;
 }
 
 bool IsRemoteDesktopSession() {

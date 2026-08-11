@@ -1,7 +1,6 @@
 #pragma once
 #include <windows.h>
 #include <string>
-#include <map>
 
 enum class WallpaperType { None, Image, Video };
 enum class MonitorMode { Span, Duplicate, PerMonitor };
@@ -10,7 +9,6 @@ struct Config {
     WallpaperType wallpaperType = WallpaperType::None;
     std::wstring wallpaperPath;
     MonitorMode monitorMode = MonitorMode::Span;
-    std::map<std::wstring, std::wstring> perMonitorPaths; // device name -> path
     bool muted = true;
     float volume = 0.5f;
     int fpsCap = 30;

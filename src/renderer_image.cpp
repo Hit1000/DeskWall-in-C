@@ -2,43 +2,13 @@
 #include "config.h"
 #include "workerw.h"
 
-#pragma comment(lib, "d2d1.lib")
-#pragma comment(lib, "windowscodecs.lib")
-
 ImageRenderer::ImageRenderer() {}
 ImageRenderer::~ImageRenderer() { Shutdown(); }
 
 bool ImageRenderer::Initialize(HWND hwnd) {
     m_hwnd = hwnd;
-
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_factory);
-    if (FAILED(hr)) {
-        LogMessage(L"ImageRenderer: D2D1CreateFactory failed");
-        return false;
-    }
-
-    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                          IID_PPV_ARGS(&m_wicFactory));
-    if (FAILED(hr)) {
-        LogMessage(L"ImageRenderer: WIC factory creation failed");
-        return false;
-    }
-
-    // Create render target at virtual screen size
-    RECT vr = GetVirtualScreenRect();
-    UINT w = vr.right - vr.left;
-    UINT h = vr.bottom - vr.top;
-
-    D2D1_SIZE_U size = D2D1::SizeU(w, h);
-    hr = m_factory->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
-        D2D1::HwndRenderTargetProperties(m_hwnd, size, D2D1_PRESENT_OPTIONS_NONE),
-        &m_renderTarget);
-    if (FAILED(hr)) {
-        LogMessage(L"ImageRenderer: CreateHwndRenderTarget failed");
-        return false;
-    }
-
+    // D2D/WIC factories and render target are created lazily in LoadImageFile
+    // to avoid allocating GPU resources when only video wallpapers are used.
     return true;
 }
 
@@ -49,8 +19,38 @@ void ImageRenderer::Shutdown() {
     if (m_factory) { m_factory->Release(); m_factory = nullptr; }
 }
 
+// Ensure D2D/WIC factories and render target exist. Called lazily from
+// LoadImageFile and OnDisplayChange so GPU resources are only allocated
+// when an image wallpaper is actually in use (not for video-only setups).
+bool ImageRenderer::EnsureResources() {
+    if (m_renderTarget) return true;
+
+    if (!m_factory) {
+        HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &m_factory);
+        if (FAILED(hr)) { LogMessage(L"ImageRenderer: D2D1CreateFactory failed"); return false; }
+    }
+    if (!m_wicFactory) {
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&m_wicFactory));
+        if (FAILED(hr)) { LogMessage(L"ImageRenderer: WIC factory creation failed"); return false; }
+    }
+
+    RECT vr = GetVirtualScreenRect();
+    UINT w = vr.right - vr.left;
+    UINT h = vr.bottom - vr.top;
+
+    HRESULT hr = m_factory->CreateHwndRenderTarget(
+        D2D1::RenderTargetProperties(),
+        D2D1::HwndRenderTargetProperties(m_hwnd, D2D1::SizeU(w, h), D2D1_PRESENT_OPTIONS_NONE),
+        &m_renderTarget);
+    if (FAILED(hr)) { LogMessage(L"ImageRenderer: CreateHwndRenderTarget failed"); return false; }
+
+    return true;
+}
+
 bool ImageRenderer::LoadImageFile(const std::wstring& path) {
-    if (!m_wicFactory || !m_renderTarget) return false;
+    m_imagePath = path;
+    if (!EnsureResources()) return false;
 
     if (m_bitmap) { m_bitmap->Release(); m_bitmap = nullptr; }
 
@@ -109,4 +109,16 @@ void ImageRenderer::Render() {
 void ImageRenderer::OnResize(UINT width, UINT height) {
     if (m_renderTarget && width > 0 && height > 0)
         m_renderTarget->Resize(D2D1::SizeU(width, height));
+}
+
+void ImageRenderer::OnDisplayChange() {
+    // Release stale render target (DPI is baked into it).
+    // Keep factories — they're DPI-independent and reusable.
+    if (m_bitmap) { m_bitmap->Release(); m_bitmap = nullptr; }
+    if (m_renderTarget) { m_renderTarget->Release(); m_renderTarget = nullptr; }
+
+    // Reload image — this recreates the render target via EnsureResources.
+    if (!m_imagePath.empty()) {
+        LoadImageFile(m_imagePath);
+    }
 }

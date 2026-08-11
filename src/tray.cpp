@@ -4,6 +4,7 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <shlobj.h>
+#include <atomic>
 
 static NOTIFYICONDATAW g_nid = {};
 static HMENU g_hMenu = nullptr;
@@ -17,33 +18,46 @@ extern void OnMenuStartWithWindows(bool enable);
 extern void OnMenuExit();
 
 // Current state for menu checkmarks
-extern bool g_paused;
-extern bool g_muted;
+extern std::atomic<bool> g_paused;
+extern std::atomic<bool> g_muted;
 extern MonitorMode g_monitorMode;
 extern bool g_startWithWindows;
 
-HWND TrayCreate(HINSTANCE hInstance, Config& config) {
-    // Create a message-only window for tray callbacks
-    WNDCLASSEXW wc = { sizeof(wc) };
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = L"DeskWallTray";
-    RegisterClassExW(&wc);
+HWND TrayCreate(HINSTANCE hInstance, Config& /*config*/) {
+    // Create a message-only window for tray callbacks.
+    // Only register the window class once — subsequent calls (e.g. after
+    // Explorer restart) skip this since the class is already registered.
+    static bool s_classRegistered = false;
+    if (!s_classRegistered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = hInstance;
+        wc.lpszClassName = L"DeskWallTray";
+        if (RegisterClassExW(&wc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS)
+            s_classRegistered = true;
+    }
 
     HWND hwnd = CreateWindowExW(0, L"DeskWallTray", L"DeskWall",
         0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInstance, nullptr);
 
     if (!hwnd) return nullptr;
 
+    // Use absolute path to exe for icon extraction — avoids failures when
+    // the working directory differs from the exe location.
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
     // Extract icon from the exe — this always reads the latest embedded
     // resource, bypassing any shell icon cache that LoadImageW can hit.
-    HICON hIcon = ExtractIconW(hInstance, L"deskwall.exe", 0);
+    HICON hIcon = ExtractIconW(hInstance, exePath, 0);
     if (!hIcon || hIcon == (HICON)1) {
         // Fallback: load at 32×32 via LoadImageW
         hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(IDI_APPICON),
             IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
     }
     if (!hIcon) {
+        // IDI_APPLICATION fits in a WORD; the MAKEINTRESOURCEW cast is safe here.
+        #pragma warning(suppress: 4302)
         hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_APPLICATION));
     }
 
@@ -88,7 +102,7 @@ static void AppendCheck(HMENU menu, UINT id, const wchar_t* text, bool checked) 
     AppendMenuW(menu, flags, id, text);
 }
 
-void TrayShowMenu(HWND hwnd, Config& config) {
+void TrayShowMenu(HWND hwnd, Config& /*config*/) {
     if (g_hMenu) DestroyMenu(g_hMenu);
     g_hMenu = CreatePopupMenu();
 

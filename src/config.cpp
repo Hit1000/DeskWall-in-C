@@ -4,8 +4,6 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 
-#pragma comment(lib, "shlwapi.lib")
-
 using json = nlohmann::json;
 
 static std::wstring GetLocalAppData() {
@@ -30,12 +28,29 @@ std::wstring LogPath() {
 
 static void EnsureDirExists() {
     std::wstring dir = ConfigDir();
-    CreateDirectoryW(dir.c_str(), nullptr);
+    // SHCreateDirectoryExW creates all intermediate directories,
+    // unlike CreateDirectoryW which only creates the final one.
+    SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
 }
 
 void LogMessage(const std::wstring& msg) {
     EnsureDirExists();
-    std::wofstream log(LogPath(), std::ios::app);
+    std::wstring logPath = LogPath();
+
+    // Rotate log if it exceeds 1 MB
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(logPath.c_str(), GetFileExInfoStandard, &fad)) {
+        LARGE_INTEGER size;
+        size.HighPart = fad.nFileSizeHigh;
+        size.LowPart = fad.nFileSizeLow;
+        if (size.QuadPart > 1024 * 1024) {
+            std::wstring oldPath = logPath + L".old";
+            DeleteFileW(oldPath.c_str());
+            MoveFileW(logPath.c_str(), oldPath.c_str());
+        }
+    }
+
+    std::wofstream log(logPath, std::ios::app);
     if (log.is_open()) {
         // Simple timestamp
         SYSTEMTIME st;
@@ -63,6 +78,19 @@ static std::wstring Utf8ToWide(const std::string& utf8) {
     return result;
 }
 
+// Validate that a wallpaper path is safe to use — reject UNC paths
+// (\\server\share) and paths that don't start with a drive letter.
+// This prevents the app from accessing arbitrary network locations
+// if the config file is tampered with.
+static bool IsValidWallpaperPath(const std::wstring& path) {
+    if (path.empty()) return false;
+    // Reject UNC paths
+    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') return false;
+    // Must start with a drive letter (e.g. C:\)
+    if (path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' && path[2] == L'\\') return true;
+    return false;
+}
+
 Config ConfigLoad() {
     Config cfg;
     std::ifstream file(ConfigPath());
@@ -77,18 +105,17 @@ Config ConfigLoad() {
         else if (type == "video") cfg.wallpaperType = WallpaperType::Video;
         else cfg.wallpaperType = WallpaperType::None;
 
-        cfg.wallpaperPath = Utf8ToWide(j.value("wallpaperPath", ""));
+        std::wstring path = Utf8ToWide(j.value("wallpaperPath", ""));
+        if (IsValidWallpaperPath(path)) {
+            cfg.wallpaperPath = path;
+        } else if (!path.empty()) {
+            LogMessage(L"Config: Rejected wallpaper path (not a local drive path)");
+        }
 
         std::string mode = j.value("monitorMode", "span");
         if (mode == "duplicate") cfg.monitorMode = MonitorMode::Duplicate;
         else if (mode == "perMonitor") cfg.monitorMode = MonitorMode::PerMonitor;
         else cfg.monitorMode = MonitorMode::Span;
-
-        if (j.contains("perMonitorPaths") && j["perMonitorPaths"].is_object()) {
-            for (auto& [key, val] : j["perMonitorPaths"].items()) {
-                cfg.perMonitorPaths[Utf8ToWide(key)] = Utf8ToWide(val.get<std::string>());
-            }
-        }
 
         cfg.muted = j.value("muted", true);
         cfg.volume = j.value("volume", 0.5f);
@@ -121,12 +148,6 @@ void ConfigSave(const Config& cfg) {
         case MonitorMode::PerMonitor: j["monitorMode"] = "perMonitor"; break;
     }
 
-    json paths = json::object();
-    for (auto& [k, v] : cfg.perMonitorPaths) {
-        paths[WideToUtf8(k)] = WideToUtf8(v);
-    }
-    j["perMonitorPaths"] = paths;
-
     j["muted"] = cfg.muted;
     j["volume"] = cfg.volume;
     j["fpsCap"] = cfg.fpsCap;
@@ -134,10 +155,19 @@ void ConfigSave(const Config& cfg) {
     j["pauseOnFullscreenApp"] = cfg.pauseOnFullscreenApp;
     j["startWithWindows"] = cfg.startWithWindows;
 
-    std::ofstream file(ConfigPath());
+    // Atomic write: write to a temp file first, then rename.
+    // This prevents corruption if the app crashes or loses power mid-write.
+    std::wstring configPath = ConfigPath();
+    std::wstring tempPath = configPath + L".tmp";
+    std::ofstream file(tempPath);
     if (file.is_open()) {
         file << j.dump(2);
+        file.close();
+        // ReplaceConfigFile uses MoveFileEx with MOVEFILE_REPLACE_EXISTING
+        // which is atomic on NTFS
+        MoveFileExW(tempPath.c_str(), configPath.c_str(), MOVEFILE_REPLACE_EXISTING);
     } else {
         LogMessage(L"Config: Failed to write config.json");
+        DeleteFileW(tempPath.c_str());
     }
 }

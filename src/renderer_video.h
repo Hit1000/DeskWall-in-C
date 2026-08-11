@@ -43,6 +43,7 @@ private:
     float m_volume = 0.5f;
     bool m_paused = false;
     bool m_mediaEngineReady = false;
+    bool m_shutdownCalled = false;
 
     IMFMediaEngine* m_mediaEngine = nullptr;
 };

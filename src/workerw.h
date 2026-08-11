@@ -21,7 +21,8 @@ bool ApplyInjection(HWND renderWindow, const InjectionResult& injection);
 bool TryInjectWallpaperWindow(HWND renderWindow);
 
 // Re-inject after Explorer restarts (TaskbarCreated message).
-void OnExplorerRestarted(HWND renderWindow);
+// Returns true if injection succeeded, false if retry is needed.
+bool ReInjectAfterExplorerRestart(HWND renderWindow);
 
 // Check if running inside a Remote Desktop session.
 bool IsRemoteDesktopSession();

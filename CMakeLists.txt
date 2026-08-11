@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
 project(DeskWall LANGUAGES CXX)
 
+# Default to Release for single-config generators (nmake, make)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
